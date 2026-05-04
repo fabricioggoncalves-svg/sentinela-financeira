@@ -29,3 +29,6 @@ Teste.py
 
 # Claude
 .claude/
+
+# Python version (não ignorar — necessário para Streamlit Cloud)
+# .python-version  ← intencionalmente NÃO ignorado
