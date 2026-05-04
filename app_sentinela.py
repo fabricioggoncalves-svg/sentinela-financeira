@@ -700,7 +700,7 @@ def _tela_login():
                 st.error(f"Erro: {type(e).__name__}: {e}")
 
     with aba_login[1]:
-        st.caption("Crie sua conta de acesso. Após o cadastro, vincule-a à sua família conforme instruções abaixo.")
+        st.caption("Crie sua conta de acesso. Após o cadastro, envie seu UID ao administrador da família para ser autorizado.")
         with st.form("form_cadastro"):
             email_c  = st.text_input("E-mail")
             senha_c  = st.text_input("Senha", type="password")
@@ -715,13 +715,11 @@ def _tela_login():
                 try:
                     resp_c  = supabase.auth.sign_up({"email": email_c, "password": senha_c})
                     user_id = resp_c.user.id
-                    st.success(f"Conta criada com sucesso!")
+                    st.success("Conta criada com sucesso!")
                     st.info(
                         f"**Seu User UID:** `{user_id}`\n\n"
-                        "Execute o SQL abaixo no Supabase para vincular sua conta à família:\n\n"
-                        f"```sql\nUPDATE familias\n"
-                        f"  SET auth_user_id = '{user_id}'\n"
-                        f"  WHERE id = '11111111-1111-1111-1111-111111111111';\n```\n\n"
+                        "Envie este código ao administrador da família. "
+                        "Ele vai adicioná-lo em **Configurações → Usuários Autorizados**.\n\n"
                         "Depois faça login na aba **Entrar**."
                     )
                 except Exception as e:
@@ -2440,6 +2438,7 @@ elif pagina == "⚙️ Configurações":
         "🗂️ Mapeamento de Compradores",
         "🚫 Estabelecimentos Ignorados",
         "🏷️ Categoria Padrão por Comprador",
+        "👤 Usuários Autorizados",
     ])
 
     # ----------------------------------------------------------------
@@ -2814,6 +2813,77 @@ elif pagina == "⚙️ Configurações":
                     supabase.rpc("delete_categoria_padrao_membro", {"p_id": cp_opts[cp_del], "p_familia_id": FAMILIA_ID}).execute()
                     st.cache_data.clear()
                     st.success("Categoria padrão excluída.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erro: {e}")
+
+    # ----------------------------------------------------------------
+    # ABA 7 — USUÁRIOS AUTORIZADOS
+    # ----------------------------------------------------------------
+    with abas_cfg[6]:
+        st.subheader("Usuários autorizados")
+        st.caption("Pessoas que podem acessar o app. Cada usuário precisa criar uma conta na aba Cadastrar e enviar o UID ao administrador.")
+
+        try:
+            res_usr = supabase.rpc("list_usuarios_familia", {"p_familia_id": FAMILIA_ID}).execute()
+            usuarios_db = res_usr.data or []
+        except Exception as e:
+            st.error(f"Erro ao carregar usuários: {e}")
+            usuarios_db = []
+
+        if usuarios_db:
+            df_usr = pd.DataFrame(usuarios_db)[["nome", "auth_user_id", "created_at"]]
+            df_usr.columns = ["Nome", "User UID", "Adicionado em"]
+            df_usr["Adicionado em"] = pd.to_datetime(df_usr["Adicionado em"]).dt.strftime("%d/%m/%Y")
+            st.dataframe(df_usr, use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhum usuário cadastrado.")
+
+        st.divider()
+        st.subheader("Autorizar novo usuário")
+        st.caption("Cole o UID que o usuário recebeu ao criar a conta.")
+        with st.form("form_usr_add"):
+            cu1, cu2 = st.columns(2)
+            with cu1:
+                usr_nome = st.text_input("Nome (para identificação)", help="Ex: Fabiana")
+            with cu2:
+                usr_uid  = st.text_input("User UID", help="UUID gerado no cadastro")
+            ok_usr = st.form_submit_button("➕ Autorizar")
+        if ok_usr:
+            if not usr_uid.strip():
+                st.warning("Informe o User UID.")
+            else:
+                try:
+                    import uuid as _uuid
+                    _uuid.UUID(usr_uid.strip())  # valida formato
+                    supabase.rpc("add_usuario_familia", {
+                        "p_familia_id":   FAMILIA_ID,
+                        "p_auth_user_id": usr_uid.strip(),
+                        "p_nome":         usr_nome.strip() or None,
+                    }).execute()
+                    st.success(f"Usuário autorizado com sucesso!")
+                    st.rerun()
+                except ValueError:
+                    st.error("UID inválido — deve ser um UUID no formato xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.")
+                except Exception as e:
+                    st.error(f"Erro: {e}")
+
+        if usuarios_db:
+            st.divider()
+            st.subheader("Revogar acesso")
+            usr_opts = {
+                f"{u.get('nome') or 'Sem nome'} — {u['auth_user_id']}": u["id"]
+                for u in usuarios_db
+            }
+            usr_del = st.selectbox("Selecione o usuário", list(usr_opts.keys()), key="usr_del_sel")
+            st.warning("⚠️ O usuário perderá acesso imediatamente.")
+            if st.button("🗑️ Revogar acesso", key="btn_usr_del"):
+                try:
+                    supabase.rpc("remove_usuario_familia", {
+                        "p_id":         usr_opts[usr_del],
+                        "p_familia_id": FAMILIA_ID,
+                    }).execute()
+                    st.success("Acesso revogado.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erro: {e}")
