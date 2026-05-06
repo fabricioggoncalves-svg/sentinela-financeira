@@ -412,7 +412,17 @@ def _extrair_linhas_extrato_itau(file_bytes: bytes, config: dict) -> list:
                     "estabelecimento": desc.strip(),
                     "valor_parcela":   valor,
                 })
-    return resultado
+
+    # PDFs Itaú com dupla camada (texto + imagem) geram o mesmo lançamento em
+    # posições Y ligeiramente diferentes → dois grupos distintos → entrada duplicada.
+    seen_keys: set = set()
+    unique: list = []
+    for item in resultado:
+        key = (item["data_origem"], item["estabelecimento"], item["valor_parcela"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique.append(item)
+    return unique
 
 
 def processar_extrato(file_name: str, file_bytes: bytes, mes_referencia: str, config: dict) -> list:
@@ -771,7 +781,8 @@ _compradores_para = _nomes_membros + ["Família"]
 pagina = st.sidebar.selectbox(
     "Navegação",
     ["📄 Processar Arquivos", "💳 Gerenciar Lançamentos", "📊 Relatórios",
-     "📂 Categorias", "🏷️ Regras de Classificação", "⚙️ Configurações"],
+     "📂 Categorias", "🏷️ Regras de Classificação", "⚙️ Configurações",
+     "🔧 Manutenção"],
 )
 
 # =============================================================
@@ -2135,82 +2146,263 @@ elif pagina == "📊 Relatórios":
 elif pagina == "📂 Categorias":
 
     st.header("📂 Categorias")
-    st.caption("Gerencie os pares de Categoria + Subcategoria disponíveis para classificação de lançamentos.")
+    st.caption("Clique em ✏️ para editar ou 🗑️ para excluir. Use os botões ➕ para adicionar.")
 
-    aba_cat = st.tabs(["➕ Incluir", "✏️ Alterar", "🗑️ Excluir", "📋 Listar todas"])
+    # --- session state ---
+    for _k, _v in [
+        ("cat_editing_id",      None),
+        ("cat_renaming",        None),
+        ("cat_adding_sub",      None),
+        ("cat_adding_new",      False),
+        ("cat_del_confirm",     None),
+        ("cat_del_cat_confirm", None),
+    ]:
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
 
-    with aba_cat[0]:
-        st.subheader("Nova categoria")
-        with st.form("form_nova_cat"):
-            nc_cat  = st.text_input("Categoria")
-            nc_sub  = st.text_input("Subcategoria")
-            ok_nc   = st.form_submit_button("✅ Incluir")
-        if ok_nc:
-            if not nc_cat:
-                st.warning("Categoria é obrigatória.")
+    cats_db = buscar_categorias_db()
+
+    from collections import defaultdict as _dd
+    _grupos: dict = _dd(list)
+    for _item in cats_db:
+        _grupos[_item["categoria"]].append(_item)
+
+    # ── Cabeçalho + botão nova categoria ──
+    _h1, _h2 = st.columns([5, 2])
+    with _h1:
+        st.subheader(f"{len(cats_db)} item(s) em {len(_grupos)} categoria(s)")
+    with _h2:
+        if st.button("➕ Nova categoria", use_container_width=True, key="btn_new_cat_top"):
+            st.session_state.cat_adding_new    = True
+            st.session_state.cat_renaming      = None
+            st.session_state.cat_editing_id    = None
+            st.session_state.cat_adding_sub    = None
+            st.rerun()
+
+    # Formulário de nova categoria (topo)
+    if st.session_state.cat_adding_new:
+        with st.form("form_cat_new_top"):
+            _nc1, _nc2 = st.columns(2)
+            with _nc1:
+                _new_cat = st.text_input("Nome da categoria", placeholder="Ex: Alimentação")
+            with _nc2:
+                _new_sub = st.text_input("Primeira subcategoria", placeholder="Ex: Mercado")
+            _btn1, _btn2 = st.columns(2)
+            with _btn1:
+                _ok_new = st.form_submit_button("✅ Criar", use_container_width=True)
+            with _btn2:
+                _cancel_new = st.form_submit_button("❌ Cancelar", use_container_width=True)
+        if _ok_new:
+            if not _new_cat.strip():
+                st.warning("Informe o nome da categoria.")
             else:
                 try:
                     supabase.table("categorias").insert({
-                        "categoria":    nc_cat.strip(),
-                        "subcategoria": nc_sub.strip(),
+                        "categoria":    _new_cat.strip(),
+                        "subcategoria": _new_sub.strip(),
                         "familia_id":   FAMILIA_ID,
                     }).execute()
-                    st.success(f'Categoria "{nc_cat} / {nc_sub}" incluída!')
-                except Exception as e:
-                    st.error(f"Erro: {e}")
-
-    with aba_cat[1]:
-        st.subheader("Alterar categoria")
-        cats_db = buscar_categorias_db()
-        if not cats_db:
-            st.info("Nenhuma categoria cadastrada.")
-        else:
-            opts_ac = {f"{c['id']} — {c['categoria']} / {c['subcategoria']}": c for c in cats_db}
-            sel_ac  = st.selectbox("Selecione", list(opts_ac.keys()), key="sel_alt_cat")
-            cat_ac  = opts_ac[sel_ac]
-            with st.form("form_alt_cat"):
-                alt_cat = st.text_input("Categoria",    value=cat_ac["categoria"])
-                alt_sub = st.text_input("Subcategoria", value=cat_ac.get("subcategoria",""))
-                ok_ac   = st.form_submit_button("💾 Salvar")
-            if ok_ac:
-                try:
-                    supabase.table("categorias").update({
-                        "categoria":    alt_cat.strip(),
-                        "subcategoria": alt_sub.strip(),
-                    }).eq("id", cat_ac["id"]).execute()
-                    st.success("Categoria atualizada!")
+                    st.session_state.cat_adding_new = False
+                    st.success(f'Categoria "{_new_cat.strip()}" criada.')
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erro: {e}")
+        if _cancel_new:
+            st.session_state.cat_adding_new = False
+            st.rerun()
 
-    with aba_cat[2]:
-        st.subheader("Excluir categoria")
-        cats_db = buscar_categorias_db()
-        if not cats_db:
-            st.info("Nenhuma categoria cadastrada.")
-        else:
-            opts_dc = {f"{c['id']} — {c['categoria']} / {c['subcategoria']}": c for c in cats_db}
-            sel_dc  = st.selectbox("Selecione para excluir", list(opts_dc.keys()), key="sel_del_cat")
-            cat_dc  = opts_dc[sel_dc]
-            st.warning(f"Excluir **{cat_dc['categoria']} / {cat_dc['subcategoria']}**?")
-            if st.button("🗑️ Confirmar exclusão", key="btn_del_cat"):
-                try:
-                    supabase.table("categorias").delete().eq("id", cat_dc["id"]).execute()
-                    st.success("Categoria excluída!")
+    if not cats_db:
+        st.info("Nenhuma categoria cadastrada. Clique em '➕ Nova categoria' para começar.")
+
+    else:
+        st.divider()
+
+        for _cat_name in sorted(_grupos.keys()):
+            _items = sorted(_grupos[_cat_name], key=lambda x: x.get("subcategoria", ""))
+            _cat_slug = _cat_name.replace(" ", "_").replace("/", "_")
+
+            # ── Cabeçalho da categoria ──
+            if st.session_state.cat_renaming == _cat_name:
+                with st.form(f"form_rename_{_cat_slug}"):
+                    _rn1, _rn2, _rn3 = st.columns([5, 1, 1])
+                    with _rn1:
+                        _rn_val = st.text_input("", value=_cat_name, label_visibility="collapsed")
+                    with _rn2:
+                        _ok_rn = st.form_submit_button("💾", use_container_width=True)
+                    with _rn3:
+                        _cancel_rn = st.form_submit_button("❌", use_container_width=True)
+                if _ok_rn:
+                    if _rn_val.strip() and _rn_val.strip() != _cat_name:
+                        try:
+                            for _it in _items:
+                                supabase.table("categorias").update(
+                                    {"categoria": _rn_val.strip()}
+                                ).eq("id", _it["id"]).execute()
+                            st.session_state.cat_renaming = None
+                            st.success(f'Categoria renomeada para "{_rn_val.strip()}".')
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro: {e}")
+                    else:
+                        st.session_state.cat_renaming = None
+                        st.rerun()
+                if _cancel_rn:
+                    st.session_state.cat_renaming = None
                     st.rerun()
-                except Exception as e:
-                    st.error(f"Erro: {e}")
+            else:
+                _ch1, _ch2, _ch3 = st.columns([5, 2, 2])
+                with _ch1:
+                    st.markdown(
+                        f"**📂 {_cat_name}**"
+                        f"<span style='color:#888;font-size:0.85em'>"
+                        f"&nbsp;({len(_items)} subcategoria{'s' if len(_items) != 1 else ''})"
+                        f"</span>",
+                        unsafe_allow_html=True,
+                    )
+                with _ch2:
+                    if st.button("✏️ Renomear", key=f"btn_rn_{_cat_slug}", use_container_width=True):
+                        st.session_state.cat_renaming      = _cat_name
+                        st.session_state.cat_editing_id    = None
+                        st.session_state.cat_adding_sub    = None
+                        st.session_state.cat_del_cat_confirm = None
+                        st.rerun()
+                with _ch3:
+                    if st.session_state.cat_del_cat_confirm == _cat_name:
+                        if st.button(
+                            "⚠️ Confirmar", key=f"btn_delcat_conf_{_cat_slug}",
+                            type="primary", use_container_width=True,
+                        ):
+                            try:
+                                for _it in _items:
+                                    supabase.table("categorias").delete().eq("id", _it["id"]).execute()
+                                st.session_state.cat_del_cat_confirm = None
+                                st.success(f'"{_cat_name}" excluída.')
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro: {e}")
+                    else:
+                        if st.button("🗑️ Excluir", key=f"btn_delcat_{_cat_slug}", use_container_width=True):
+                            st.session_state.cat_del_cat_confirm = _cat_name
+                            st.session_state.cat_editing_id      = None
+                            st.session_state.cat_renaming        = None
+                            st.rerun()
 
-    with aba_cat[3]:
-        st.subheader("Todas as categorias")
-        cats_db = buscar_categorias_db()
-        if not cats_db:
-            st.info("Nenhuma categoria cadastrada.")
-        else:
-            df_cats = pd.DataFrame(cats_db)[["id","categoria","subcategoria"]]
-            df_cats.columns = ["ID","Categoria","Subcategoria"]
-            st.dataframe(df_cats, use_container_width=True, hide_index=True)
-            st.caption(f"{len(cats_db)} categoria(s) cadastrada(s)")
+            # ── Subcategorias ──
+            for _item in _items:
+                _iid = _item["id"]
+                _is_editing     = st.session_state.cat_editing_id == _iid
+                _is_del_confirm = st.session_state.cat_del_confirm == _iid
+
+                if _is_editing:
+                    with st.form(f"form_edit_sub_{_iid}"):
+                        _ec1, _ec2, _ec3 = st.columns([5, 1, 1])
+                        with _ec1:
+                            _edit_val = st.text_input(
+                                "", value=_item["subcategoria"],
+                                label_visibility="collapsed",
+                            )
+                        with _ec2:
+                            _ok_edit = st.form_submit_button("💾", use_container_width=True)
+                        with _ec3:
+                            _cancel_edit = st.form_submit_button("❌", use_container_width=True)
+                    if _ok_edit:
+                        try:
+                            supabase.table("categorias").update(
+                                {"subcategoria": _edit_val.strip()}
+                            ).eq("id", _iid).execute()
+                            st.session_state.cat_editing_id = None
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro: {e}")
+                    if _cancel_edit:
+                        st.session_state.cat_editing_id = None
+                        st.rerun()
+
+                elif _is_del_confirm:
+                    _dc1, _dc2, _dc3 = st.columns([5, 2, 1])
+                    with _dc1:
+                        st.markdown(
+                            f"&nbsp;&nbsp;&nbsp;&nbsp;↳ "
+                            f"<span style='color:#e05;text-decoration:line-through'>"
+                            f"{_item['subcategoria']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                    with _dc2:
+                        if st.button("⚠️ Confirmar", key=f"conf_del_{_iid}",
+                                     type="primary", use_container_width=True):
+                            try:
+                                supabase.table("categorias").delete().eq("id", _iid).execute()
+                                st.session_state.cat_del_confirm = None
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro: {e}")
+                    with _dc3:
+                        if st.button("❌", key=f"cancel_del_{_iid}", use_container_width=True):
+                            st.session_state.cat_del_confirm = None
+                            st.rerun()
+
+                else:
+                    _sc1, _sc2, _sc3 = st.columns([5, 1, 1])
+                    with _sc1:
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;↳ {_item['subcategoria']}")
+                    with _sc2:
+                        if st.button("✏️", key=f"edit_{_iid}",
+                                     use_container_width=True, help="Editar subcategoria"):
+                            st.session_state.cat_editing_id      = _iid
+                            st.session_state.cat_renaming        = None
+                            st.session_state.cat_del_confirm     = None
+                            st.session_state.cat_del_cat_confirm = None
+                            st.rerun()
+                    with _sc3:
+                        if st.button("🗑️", key=f"del_{_iid}",
+                                     use_container_width=True, help="Excluir subcategoria"):
+                            st.session_state.cat_del_confirm     = _iid
+                            st.session_state.cat_editing_id      = None
+                            st.session_state.cat_del_cat_confirm = None
+                            st.rerun()
+
+            # ── Adicionar subcategoria ──
+            if st.session_state.cat_adding_sub == _cat_name:
+                with st.form(f"form_add_sub_{_cat_slug}"):
+                    _as1, _as2, _as3 = st.columns([5, 1, 1])
+                    with _as1:
+                        _new_sub_val = st.text_input(
+                            "", placeholder="Nova subcategoria",
+                            label_visibility="collapsed",
+                        )
+                    with _as2:
+                        _ok_sub = st.form_submit_button("✅", use_container_width=True)
+                    with _as3:
+                        _cancel_sub = st.form_submit_button("❌", use_container_width=True)
+                if _ok_sub:
+                    if not _new_sub_val.strip():
+                        st.warning("Informe o nome da subcategoria.")
+                    else:
+                        try:
+                            supabase.table("categorias").insert({
+                                "categoria":    _cat_name,
+                                "subcategoria": _new_sub_val.strip(),
+                                "familia_id":   FAMILIA_ID,
+                            }).execute()
+                            st.session_state.cat_adding_sub = None
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro: {e}")
+                if _cancel_sub:
+                    st.session_state.cat_adding_sub = None
+                    st.rerun()
+            else:
+                _add1, _add2, _add3 = st.columns([5, 2, 1])
+                with _add2:
+                    if st.button("➕ Subcategoria", key=f"btn_add_sub_{_cat_slug}",
+                                 use_container_width=True):
+                        st.session_state.cat_adding_sub      = _cat_name
+                        st.session_state.cat_editing_id      = None
+                        st.session_state.cat_renaming        = None
+                        st.session_state.cat_del_cat_confirm = None
+                        st.rerun()
+
+            st.divider()
 
 
 # =============================================================
@@ -2887,3 +3079,332 @@ elif pagina == "⚙️ Configurações":
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erro: {e}")
+
+# =============================================================
+# PÁGINA 7 — MANUTENÇÃO
+# =============================================================
+elif pagina == "🔧 Manutenção":
+    st.header("🔧 Manutenção")
+
+    abas_man = st.tabs(["🗑️ Apagar Lançamentos", "📋 Templates"])
+
+    with abas_man[0]:
+        st.subheader("Apagar base de lançamentos")
+        st.caption("Remove todos os lançamentos da família. Use para começar do zero ou corrigir importações incorretas.")
+
+        try:
+            res_apagar = supabase.table("lancamentos").select("id", count="exact").eq("familia_id", FAMILIA_ID).execute()
+            total_lanc = res_apagar.count or 0
+        except Exception as e:
+            st.error(f"Erro ao contar lançamentos: {e}")
+            total_lanc = None
+
+        if total_lanc is not None:
+            if total_lanc == 0:
+                st.success("✅ A base de lançamentos já está vazia.")
+            else:
+                st.metric("Lançamentos na base", f"{total_lanc:,}".replace(",", "."))
+                st.divider()
+                st.error("⚠️ **ATENÇÃO:** Esta ação apagará permanentemente **todos** os lançamentos desta família. Não há como desfazer.")
+                confirmar_apagar = st.checkbox(
+                    "Entendo que esta ação é irreversível e desejo continuar",
+                    key="chk_apagar_lanc",
+                )
+                if confirmar_apagar:
+                    if st.button("🗑️ Apagar todos os lançamentos", type="primary", key="btn_apagar_lanc"):
+                        try:
+                            supabase.table("lancamentos").delete().eq("familia_id", FAMILIA_ID).execute()
+                            st.success(f"✅ {total_lanc} lançamento(s) apagado(s) com sucesso.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro: {e}")
+
+    with abas_man[1]:
+        st.subheader("Templates de Categorias e Regras de Classificação")
+        st.caption("Crie um ponto de partida para categorias e regras. Disponível somente quando a base de lançamentos está vazia.")
+
+        try:
+            res_tpl_chk = supabase.table("lancamentos").select("id", count="exact").eq("familia_id", FAMILIA_ID).execute()
+            total_tpl = res_tpl_chk.count or 0
+        except Exception as e:
+            st.error(f"Erro ao verificar base de lançamentos: {e}")
+            total_tpl = -1
+
+        if total_tpl > 0:
+            st.warning(
+                f"⚠️ A base de lançamentos contém **{total_tpl} registro(s)**. "
+                "Apague todos os lançamentos na aba **🗑️ Apagar Lançamentos** antes de aplicar um template."
+            )
+        elif total_tpl == 0:
+            _TEMPLATE_CATS = [
+                ("Alimentação",      "Mercado"),
+                ("Alimentação",      "Restaurante"),
+                ("Alimentação",      "Delivery"),
+                ("Alimentação",      "Padaria / Café"),
+                ("Saúde",            "Farmácia"),
+                ("Saúde",            "Consulta Médica"),
+                ("Saúde",            "Plano de Saúde"),
+                ("Saúde",            "Exames e Laboratório"),
+                ("Transporte",       "Combustível"),
+                ("Transporte",       "Aplicativo (Uber/99)"),
+                ("Transporte",       "Estacionamento e Pedágio"),
+                ("Transporte",       "Manutenção Veicular"),
+                ("Moradia",          "Condomínio"),
+                ("Moradia",          "Energia Elétrica"),
+                ("Moradia",          "Água e Esgoto"),
+                ("Moradia",          "Internet e TV"),
+                ("Moradia",          "Manutenção e Reforma"),
+                ("Lazer",            "Streaming"),
+                ("Lazer",            "Cinema e Teatro"),
+                ("Lazer",            "Viagem e Hospedagem"),
+                ("Lazer",            "Esporte e Academia"),
+                ("Educação",         "Escola e Faculdade"),
+                ("Educação",         "Cursos e Livros"),
+                ("Vestuário",        "Roupas"),
+                ("Vestuário",        "Calçados e Acessórios"),
+                ("Compras Online",   "Amazon"),
+                ("Compras Online",   "Shopee / Mercado Livre"),
+                ("Compras Pessoais", "Diversos"),
+                ("Serviços",         "Assinaturas"),
+                ("Serviços",         "Serviços Domésticos"),
+                ("Finanças",         "Tarifas Bancárias"),
+                ("Finanças",         "Investimentos"),
+                ("Outros",           "A Classificar"),
+            ]
+
+            _TEMPLATE_REGRAS = [
+                # (palavra_chave, categoria, subcategoria, prioridade)
+                ("SUPERMERCADO",     "Alimentação",      "Mercado",                   5),
+                ("CARREFOUR",        "Alimentação",      "Mercado",                   6),
+                ("PAO DE ACUCAR",    "Alimentação",      "Mercado",                   6),
+                ("EXTRA HIPER",      "Alimentação",      "Mercado",                   6),
+                ("ATACADAO",         "Alimentação",      "Mercado",                   6),
+                ("MERCADO",          "Alimentação",      "Mercado",                   3),
+                ("IFOOD",            "Alimentação",      "Delivery",                  9),
+                ("RAPPI",            "Alimentação",      "Delivery",                  9),
+                ("UBER EATS",        "Alimentação",      "Delivery",                  9),
+                ("RESTAURANTE",      "Alimentação",      "Restaurante",               4),
+                ("LANCHONETE",       "Alimentação",      "Restaurante",               4),
+                ("PIZZARIA",         "Alimentação",      "Restaurante",               5),
+                ("BURGER",           "Alimentação",      "Restaurante",               5),
+                ("MC DONALDS",       "Alimentação",      "Restaurante",               7),
+                ("SUBWAY",           "Alimentação",      "Restaurante",               7),
+                ("DROGASIL",         "Saúde",            "Farmácia",                  8),
+                ("DROGA RAIA",       "Saúde",            "Farmácia",                  8),
+                ("ULTRAFARMA",       "Saúde",            "Farmácia",                  8),
+                ("FARMACIA",         "Saúde",            "Farmácia",                  5),
+                ("DROGARIA",         "Saúde",            "Farmácia",                  5),
+                ("SHELL",            "Transporte",       "Combustível",               8),
+                ("IPIRANGA",         "Transporte",       "Combustível",               8),
+                ("BR DISTRIBUIDORA", "Transporte",       "Combustível",               8),
+                ("POSTO ",           "Transporte",       "Combustível",               4),
+                ("UBER",             "Transporte",       "Aplicativo (Uber/99)",      8),
+                ("99APP",            "Transporte",       "Aplicativo (Uber/99)",      8),
+                ("CONDOMINIO",       "Moradia",          "Condomínio",                7),
+                ("CEMIG",            "Moradia",          "Energia Elétrica",          9),
+                ("COPEL",            "Moradia",          "Energia Elétrica",          9),
+                ("ENEL",             "Moradia",          "Energia Elétrica",          9),
+                ("SABESP",           "Moradia",          "Água e Esgoto",             9),
+                ("SANEPAR",          "Moradia",          "Água e Esgoto",             9),
+                ("CLARO",            "Moradia",          "Internet e TV",             7),
+                ("VIVO",             "Moradia",          "Internet e TV",             7),
+                ("TIM ",             "Moradia",          "Internet e TV",             7),
+                ("OI ",              "Moradia",          "Internet e TV",             7),
+                ("NETFLIX",          "Lazer",            "Streaming",                 9),
+                ("SPOTIFY",          "Lazer",            "Streaming",                 9),
+                ("AMAZON PRIME",     "Lazer",            "Streaming",                 9),
+                ("DISNEY",           "Lazer",            "Streaming",                 9),
+                ("HBO MAX",          "Lazer",            "Streaming",                 9),
+                ("APPLE TV",         "Lazer",            "Streaming",                 9),
+                ("YOUTUBE PREMIUM",  "Lazer",            "Streaming",                 9),
+                ("SMARTFIT",         "Lazer",            "Esporte e Academia",        9),
+                ("ACADEMIA",         "Lazer",            "Esporte e Academia",        6),
+                ("ESCOLA",           "Educação",         "Escola e Faculdade",        6),
+                ("FACULDADE",        "Educação",         "Escola e Faculdade",        6),
+                ("UNIVERS",          "Educação",         "Escola e Faculdade",        6),
+                ("AMAZON",           "Compras Online",   "Amazon",                    7),
+                ("SHOPEE",           "Compras Online",   "Shopee / Mercado Livre",    8),
+                ("MERCADO LIVRE",    "Compras Online",   "Shopee / Mercado Livre",    8),
+                ("ANUIDADE",         "Finanças",         "Tarifas Bancárias",         7),
+                ("TARIFA",           "Finanças",         "Tarifas Bancárias",         5),
+            ]
+
+            t_auto, t_manual, t_salvar = st.tabs(["⚡ Template Automático", "✏️ Template Manual", "💾 Salvar Configuração como Template"])
+
+            with t_auto:
+                st.markdown(
+                    "O sistema aplicará automaticamente o conjunto de categorias e regras sugerido abaixo. "
+                    "Você poderá ajustar qualquer item depois nas páginas de **Regras de Classificação** e **Configurações**."
+                )
+
+                with st.expander(f"📂 Ver {len(_TEMPLATE_CATS)} categorias que serão criadas"):
+                    for cat, sub in _TEMPLATE_CATS:
+                        st.markdown(f"- **{cat}** / {sub}")
+
+                with st.expander(f"📋 Ver {len(_TEMPLATE_REGRAS)} regras que serão criadas"):
+                    for pk, cat, sub, pri in _TEMPLATE_REGRAS:
+                        st.markdown(f"- `{pk}` → **{cat}** / {sub} *(prioridade {pri})*")
+
+                st.divider()
+                confirmar_tpl = st.checkbox(
+                    "Confirmo que desejo aplicar o template automático",
+                    key="chk_tpl_auto",
+                )
+                if confirmar_tpl:
+                    if st.button("⚡ Aplicar template automático", type="primary", key="btn_tpl_auto"):
+                        erros_tpl = []
+                        try:
+                            cat_records = [{"categoria": c, "subcategoria": s} for c, s in _TEMPLATE_CATS]
+                            supabase.table("categorias").insert(cat_records).execute()
+                        except Exception as e:
+                            erros_tpl.append(f"Categorias: {e}")
+                        try:
+                            reg_records = [
+                                {
+                                    "palavra_chave": pk,
+                                    "categoria":     cat,
+                                    "subcategoria":  sub,
+                                    "prioridade":    pri,
+                                    "familia_id":    FAMILIA_ID,
+                                }
+                                for pk, cat, sub, pri in _TEMPLATE_REGRAS
+                            ]
+                            supabase.table("regras_classificacao").insert(reg_records).execute()
+                        except Exception as e:
+                            erros_tpl.append(f"Regras: {e}")
+
+                        if erros_tpl:
+                            for err in erros_tpl:
+                                st.error(f"Erro: {err}")
+                        else:
+                            st.success(
+                                f"✅ Template aplicado com sucesso: "
+                                f"{len(_TEMPLATE_CATS)} categorias e {len(_TEMPLATE_REGRAS)} regras criadas."
+                            )
+                            st.cache_data.clear()
+                            st.rerun()
+
+            with t_manual:
+                st.markdown(
+                    "Adicione manualmente as categorias e regras que deseja usar. "
+                    "Comece pelas categorias — as regras dependem delas."
+                )
+
+                col_cat_m, col_reg_m = st.columns(2)
+
+                with col_cat_m:
+                    st.subheader("Categorias / Subcategorias")
+                    with st.form("form_tpl_cat"):
+                        tpl_cat = st.text_input("Categoria", help="Ex: Alimentação")
+                        tpl_sub = st.text_input("Subcategoria", help="Ex: Mercado")
+                        ok_tpl_cat = st.form_submit_button("➕ Adicionar")
+                    if ok_tpl_cat:
+                        if not tpl_cat.strip() or not tpl_sub.strip():
+                            st.warning("Preencha categoria e subcategoria.")
+                        else:
+                            try:
+                                supabase.table("categorias").insert({
+                                    "categoria":    tpl_cat.strip(),
+                                    "subcategoria": tpl_sub.strip(),
+                                }).execute()
+                                st.success(f'"{tpl_cat.strip()} / {tpl_sub.strip()}" adicionada.')
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro: {e}")
+
+                with col_reg_m:
+                    st.subheader("Regras de Classificação")
+                    cats_atuais_tpl = buscar_categorias_db()
+                    opcoes_cat_tpl  = sorted(
+                        set(f"{c['categoria']} / {c['subcategoria']}" for c in cats_atuais_tpl)
+                    ) if cats_atuais_tpl else []
+
+                    if not opcoes_cat_tpl:
+                        st.info("Adicione ao menos uma categoria antes de criar regras.")
+                    else:
+                        with st.form("form_tpl_reg"):
+                            tpl_pk     = st.text_input("Palavra-chave", help="Ex: IFOOD")
+                            tpl_catsel = st.selectbox("Categoria / Subcategoria", opcoes_cat_tpl)
+                            tpl_pri    = st.slider("Prioridade", 1, 10, 5)
+                            ok_tpl_reg = st.form_submit_button("➕ Adicionar")
+                        if ok_tpl_reg:
+                            if not tpl_pk.strip():
+                                st.warning("Informe a palavra-chave.")
+                            else:
+                                cat_parts = tpl_catsel.split(" / ", 1)
+                                try:
+                                    supabase.table("regras_classificacao").insert({
+                                        "palavra_chave": tpl_pk.strip().upper(),
+                                        "categoria":     cat_parts[0],
+                                        "subcategoria":  cat_parts[1] if len(cat_parts) > 1 else "",
+                                        "prioridade":    tpl_pri,
+                                        "familia_id":    FAMILIA_ID,
+                                    }).execute()
+                                    st.success(f'Regra "{tpl_pk.strip().upper()}" adicionada.')
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro: {e}")
+
+            with t_salvar:
+                st.markdown(
+                    "Gera um arquivo JSON com todas as categorias e regras de classificação "
+                    "atualmente configuradas para esta família. "
+                    "Use para guardar um ponto de restauração ou para aplicar em outro ambiente."
+                )
+
+                import json as _json
+                from datetime import datetime as _dt_tpl
+
+                cats_salvar = buscar_categorias_db()
+                regs_salvar = buscar_regras_db()
+
+                if not cats_salvar and not regs_salvar:
+                    st.info("Não há categorias ou regras configuradas para salvar como template.")
+                else:
+                    c_s1, c_s2 = st.columns(2)
+                    with c_s1:
+                        st.metric("Categorias", len(cats_salvar))
+                    with c_s2:
+                        st.metric("Regras de Classificação", len(regs_salvar))
+
+                    with st.expander(f"📂 Ver {len(cats_salvar)} categorias"):
+                        for c in sorted(cats_salvar, key=lambda x: (x.get("categoria", ""), x.get("subcategoria", ""))):
+                            st.markdown(f"- **{c['categoria']}** / {c['subcategoria']}")
+
+                    with st.expander(f"📋 Ver {len(regs_salvar)} regras"):
+                        for r in sorted(regs_salvar, key=lambda x: (x.get("categoria", ""), x.get("palavra_chave", ""))):
+                            st.markdown(
+                                f"- `{r['palavra_chave']}` → **{r['categoria']}** / "
+                                f"{r.get('subcategoria', '')} *(prioridade {r.get('prioridade', 0)})*"
+                            )
+
+                    template_json = _json.dumps(
+                        {
+                            "nome":       f"Template — {_dt_tpl.now().strftime('%Y-%m-%d')}",
+                            "gerado_em":  _dt_tpl.now().isoformat(),
+                            "categorias": [
+                                {"categoria": c["categoria"], "subcategoria": c["subcategoria"]}
+                                for c in cats_salvar
+                            ],
+                            "regras": [
+                                {
+                                    "palavra_chave": r["palavra_chave"],
+                                    "categoria":     r["categoria"],
+                                    "subcategoria":  r.get("subcategoria", ""),
+                                    "prioridade":    r.get("prioridade", 0),
+                                }
+                                for r in regs_salvar
+                            ],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                    st.divider()
+                    st.download_button(
+                        label="💾 Baixar template como JSON",
+                        data=template_json,
+                        file_name=f"template_{_dt_tpl.now().strftime('%Y%m%d')}.json",
+                        mime="application/json",
+                        type="primary",
+                    )

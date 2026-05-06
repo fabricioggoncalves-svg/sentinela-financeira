@@ -1,4 +1,5 @@
 # Segredos — NUNCA subir
+.env
 .streamlit/secrets.toml
 Chaves.txt
 
