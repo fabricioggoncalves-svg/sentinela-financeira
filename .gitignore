@@ -28,7 +28,11 @@ Tabela*/
 Regras*/
 Extrair.py
 Teste.py
-"import pdfplumber.py"
+import pdfplumber.py
+
+# Logs e artefatos de testes locais
+streamlit.log
+.playwright-mcp/
 
 # Claude
 .claude/
