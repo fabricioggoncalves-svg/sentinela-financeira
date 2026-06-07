@@ -2,6 +2,8 @@
 .env
 .streamlit/secrets.toml
 Chaves.txt
+google_credentials.json
+google_token.json
 
 # Documentos financeiros
 *.pdf

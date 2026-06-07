@@ -1,11 +1,14 @@
 import streamlit as st
 import pandas as pd
 import json
+import os
 import re
+import tempfile
 import unicodedata
 import pdfplumber
 import io
 from datetime import date
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from supabase import create_client
 from google import genai
@@ -32,6 +35,63 @@ if "sb_access_token" in st.session_state:
     except Exception:
         for _k in ["sb_access_token", "sb_refresh_token", "familia_id"]:
             st.session_state.pop(_k, None)
+
+# --- Google OAuth ---
+_GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
+_GOOGLE_REDIRECT = "http://localhost:8501/"
+_GOOGLE_CREDS_FILE = "google_credentials.json"
+_GOOGLE_TOKEN_FILE = "google_token.json"
+_OAUTH_STATE_DIR = Path(tempfile.gettempdir()) / "cf_oauth_states"
+
+# Handler do callback OAuth — deve rodar ANTES do auth check para restaurar sessão
+os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+_qp = st.query_params
+if "code" in _qp and "state" in _qp:
+    _state_file = _OAUTH_STATE_DIR / f"{_qp['state']}.json"
+    if _state_file.exists():
+        try:
+            _state_data = json.loads(_state_file.read_text())
+            _state_file.unlink()
+            for _k in ("sb_access_token", "sb_refresh_token", "familia_id"):
+                if _state_data.get(_k):
+                    st.session_state[_k] = _state_data[_k]
+            if _state_data.get("sb_access_token"):
+                supabase.auth.set_session(
+                    _state_data["sb_access_token"],
+                    _state_data["sb_refresh_token"],
+                )
+                supabase.postgrest.auth(_state_data["sb_access_token"])
+            from google_auth_oauthlib.flow import Flow as _GFlow
+            _flow = _GFlow.from_client_secrets_file(
+                _GOOGLE_CREDS_FILE,
+                scopes=_GOOGLE_SCOPES,
+                redirect_uri=_GOOGLE_REDIRECT,
+            )
+            _flow.fetch_token(code=_qp["code"])
+            _creds = _flow.credentials
+            _token_data = {
+                "token":         _creds.token,
+                "refresh_token": _creds.refresh_token,
+                "token_uri":     _creds.token_uri,
+                "client_id":     _creds.client_id,
+                "client_secret": _creds.client_secret,
+                "scopes":        list(_creds.scopes or []),
+                "expiry":        _creds.expiry.isoformat() if _creds.expiry else None,
+            }
+            with open(_GOOGLE_TOKEN_FILE, "w") as _f:
+                json.dump(_token_data, _f)
+            st.session_state["google_token"] = _token_data
+            st.session_state["google_conectado"] = True
+            st.session_state["modulo_ativo"] = _state_data.get("modulo_origem", "📅 Agenda")
+        except Exception as _e:
+            st.session_state["google_oauth_error"] = str(_e)
+            st.session_state["modulo_ativo"] = _state_data.get("modulo_origem", "📅 Agenda")
+        st.query_params.clear()
+        st.rerun()
 
 TIPOS_PAGAMENTO = {
     "01": "01 - Cartão de Crédito",
@@ -276,6 +336,12 @@ def processar_fatura(file_name: str, file_bytes: bytes, mes_referencia: str, con
         "INCLUA: compras à vista, parcelas que vencem nesta fatura, "
         "tarifas, anuidades, IOF, lançamentos internacionais e produtos/serviços.\n"
         "NÃO INCLUA: lançamentos da seção \'Compras parceladas - próximas faturas\'.\n"
+        "ATENÇÃO CRÍTICA: A fatura pode conter ao final uma seção intitulada "
+        "\'Compras parceladas - próximas faturas\', \'Próxima fatura\' ou \'Demais faturas\'. "
+        "Essa seção lista parcelas FUTURAS que NÃO devem ser incluídas. "
+        "Ao encontrar qualquer um desses títulos, IGNORE TODO o conteúdo que se segue até o fim do trecho.\n"
+        "Se um estabelecimento aparecer com duas versões de parcela (ex: \'01/03\' e \'02/03\'), "
+        "inclua APENAS a parcela com o número menor (a atual). Nunca inclua a parcela seguinte.\n"
         "NÃO INCLUA: pagamentos efetuados (créditos de pagamento de fatura).\n"
         "Se este trecho não contiver lançamentos, retorne um array vazio [].\n"
         "Use o valor exato de cada lançamento. Inclua cancelamentos (valores negativos).\n"
@@ -289,8 +355,14 @@ def processar_fatura(file_name: str, file_bytes: bytes, mes_referencia: str, con
     if tem_multiplos_portadores:
         estrutura = '[{"data_origem":"AAAA-MM-DD","estabelecimento":"NOME","valor_parcela":0.0,"descricao":"","comprado_por":"NOME DO PORTADOR"}]'
         extra = (
-            "A fatura pode ter seções por portador. "
-            "Identifique o nome do portador conforme o cabeçalho de cada seção.\n"
+            "A fatura pode ter seções por portador ou por número de cartão.\n"
+            "Identifique o nome do portador pelo cabeçalho de cada seção — "
+            "pode aparecer como 'NOME DO PORTADOR', 'Cartão XXXX - NOME' ou similar.\n"
+            "Quando múltiplos cartões pertencem ao mesmo titular (ex: 'Cartão Final 0513 - FABRICIO', "
+            "'Cartão Final 4315 - FABRICIO'), use o nome desse titular para todos.\n"
+            "Para seção de 'cartões adicionais', use o nome do portador do cartão adicional.\n"
+            "Inclua estornos como valores NEGATIVOS (ex: 'Estorno Tarifa' → valor_parcela negativo).\n"
+            "NÃO inclua linhas de IOF listadas separadamente — o IOF já está embutido no valor da compra.\n"
         )
     else:
         estrutura = '[{"data_origem":"AAAA-MM-DD","estabelecimento":"NOME","valor_parcela":0.0,"descricao":""}]'
@@ -304,28 +376,68 @@ def processar_fatura(file_name: str, file_bytes: bytes, mes_referencia: str, con
 
     # Processa cada bloco e consolida
     todos_dados = []
+    erros_blocos = []
     for bloco in blocos:
         texto_bloco = "\n\n".join(bloco)
         prompt = instrucoes_base + sufixo + f"Trecho da fatura:\n{texto_bloco}"
         try:
             parcial = _chamar_ia_fatura(prompt)
             todos_dados.extend(parcial)
-        except Exception:
-            # Se um bloco falhar, tenta com o bloco inteiro como fallback
-            pass
+        except Exception as _e_bloco:
+            erros_blocos.append(str(_e_bloco))
+
+    if erros_blocos and not todos_dados:
+        raise RuntimeError(
+            f"Falha ao processar '{file_name}' via IA. "
+            f"Erros: {'; '.join(erros_blocos[:2])}"
+        )
+
+    # Fallback: se texto não rendeu nada, envia o PDF inteiro ao Gemini como arquivo
+    if not todos_dados:
+        instrucao_direta = (
+            instrucoes_base
+            + "ATENÇÃO: ignore completamente seções de 'Opções de pagamento', "
+            "'Pagamento de fatura', 'Parcelamento', 'FAQ' e similares. "
+            "Extraia SOMENTE as transações de compra listadas nas seções "
+            "'Transações do cartão', 'Lançamentos' ou similares.\n"
+            "NÃO inclua: pagamentos de fatura (ex: 'Pag Fatura Boleto'), "
+            "IOF e taxas listados como linhas separadas de transações.\n"
+            + sufixo
+        )
+        try:
+            _arq = client.files.upload(
+                file=io.BytesIO(file_bytes),
+                config=types.UploadFileConfig(mime_type="application/pdf", display_name=file_name),
+            )
+            _resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Part.from_uri(file_uri=_arq.uri, mime_type="application/pdf"),
+                    instrucao_direta,
+                ],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=0)
+                ),
+            )
+            todos_dados = json.loads(re.sub(r"```[\w]*|```", "", _resp.text).strip())
+        except Exception as _e_fb:
+            raise RuntimeError(
+                f"Falha ao processar '{file_name}' (texto e upload): {_e_fb}"
+            )
 
     ignorados_fatura = [e["texto"].upper() for e in config["ignorados"] if e["tipo"] == "fatura"]
 
-    # Remove duplicatas exatas e lançamentos substituídos por regras internas
-    vistos = set()
+    # Remove somente triplicatas+ (mesma data+estabelecimento+valor aparecendo 3+ vezes indica erro da IA)
+    # Duplicatas legítimas são permitidas (ex: mesma loja comprada duas vezes no mesmo dia)
+    contagem: dict = {}
     dados = []
     for d in todos_dados:
         estab_up = (d.get("estabelecimento") or "").upper()
         if any(ign in estab_up for ign in ignorados_fatura):
             continue
         chave = (d.get("data_origem",""), d.get("estabelecimento",""), d.get("valor_parcela",0))
-        if chave not in vistos:
-            vistos.add(chave)
+        contagem[chave] = contagem.get(chave, 0) + 1
+        if contagem[chave] <= 2:
             dados.append(d)
 
     ano, mes, _ = mes_referencia.split("-")
@@ -736,9 +848,242 @@ def _tela_login():
                     st.error(f"Erro no cadastro: {e}")
 
 
+# --- 3b. FUNÇÕES GOOGLE ---
+
+def google_iniciar_oauth() -> str:
+    """Salva estado da sessão e retorna URL de autenticação Google."""
+    import secrets as _sec
+    from google_auth_oauthlib.flow import Flow
+
+    _OAUTH_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state_id = _sec.token_urlsafe(16)
+    (_OAUTH_STATE_DIR / f"{state_id}.json").write_text(json.dumps({
+        "sb_access_token": st.session_state.get("sb_access_token", ""),
+        "sb_refresh_token": st.session_state.get("sb_refresh_token", ""),
+        "familia_id":       st.session_state.get("familia_id", ""),
+        "modulo_origem":    st.session_state.get("modulo_ativo", "📅 Agenda"),
+    }))
+    flow = Flow.from_client_secrets_file(
+        _GOOGLE_CREDS_FILE, scopes=_GOOGLE_SCOPES, redirect_uri=_GOOGLE_REDIRECT,
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline", include_granted_scopes="true", prompt="consent", state=state_id,
+    )
+    return auth_url
+
+
+def google_get_credentials():
+    """Carrega credenciais Google; renova token se expirado. Retorna None se não conectado."""
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from datetime import datetime as _dtt
+
+    token_data = st.session_state.get("google_token")
+    if not token_data and os.path.exists(_GOOGLE_TOKEN_FILE):
+        with open(_GOOGLE_TOKEN_FILE) as f:
+            token_data = json.load(f)
+        st.session_state["google_token"] = token_data
+    if not token_data:
+        return None
+
+    expiry = None
+    if token_data.get("expiry"):
+        try:
+            expiry = _dtt.fromisoformat(token_data["expiry"])
+        except Exception:
+            pass
+
+    creds = Credentials(
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=token_data.get("client_id"),
+        client_secret=token_data.get("client_secret"),
+        scopes=token_data.get("scopes"),
+        expiry=expiry,
+    )
+    if creds.expired and creds.refresh_token:
+        from google.auth.exceptions import RefreshError
+        try:
+            creds.refresh(Request())
+        except RefreshError:
+            # Refresh token expirado/revogado pelo Google — descarta e força reconexão
+            st.session_state.pop("google_token", None)
+            if os.path.exists(_GOOGLE_TOKEN_FILE):
+                os.remove(_GOOGLE_TOKEN_FILE)
+            st.session_state["google_oauth_error"] = (
+                "Sua conexão com o Google expirou ou foi revogada. Conecte novamente."
+            )
+            return None
+        token_data.update(token=creds.token, expiry=creds.expiry.isoformat() if creds.expiry else None)
+        st.session_state["google_token"] = token_data
+        with open(_GOOGLE_TOKEN_FILE, "w") as f:
+            json.dump(token_data, f)
+    return creds
+
+
+def google_listar_eventos(creds, dias: int = 7) -> list:
+    """Retorna eventos do Google Calendar primário nos próximos `dias` dias."""
+    from googleapiclient.discovery import build
+    from datetime import datetime as _dtt, timezone as _tz, timedelta as _td
+
+    service = build("calendar", "v3", credentials=creds)
+    now = _dtt.now(_tz.utc)
+    result = service.events().list(
+        calendarId="primary",
+        timeMin=now.isoformat(),
+        timeMax=(now + _td(days=dias)).isoformat(),
+        maxResults=50,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+    return result.get("items", [])
+
+
+_PALAVRAS_EMAIL_FINANCEIRO = [
+    "boleto", "fatura", "vencimento", "vencendo", "pagamento", "cobrança", "cobranca",
+    "débito", "debito", "fatura disponível", "invoice", "nota fiscal", "recibo", "comprovante",
+]
+
+
+def _email_eh_financeiro(assunto: str, resumo: str) -> bool:
+    """Heurística simples: assunto ou resumo contém palavra-chave de cobrança/fatura."""
+    texto = unicodedata.normalize("NFKD", f"{assunto} {resumo}".lower())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return any(p in texto for p in _PALAVRAS_EMAIL_FINANCEIRO)
+
+
+def _email_eh_muito_importante(remetente: str, regras: list) -> bool:
+    """Verifica se o remetente bate com algum critério (domínio ou e-mail) de algum grupo ativo."""
+    _match = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", remetente or "")
+    if not _match:
+        return False
+    _email = _match.group(0).lower()
+    _dominio = _email.split("@", 1)[1]
+    for _regra in regras:
+        if not _regra.get("ativo", True):
+            continue
+        for _crit in _regra.get("criterios", []):
+            _valor = (_crit.get("valor") or "").lower()
+            _tipo = _crit.get("tipo")
+            if _tipo == "dominio" and (_dominio == _valor or _dominio.endswith("." + _valor)):
+                return True
+            if _tipo == "email" and _email == _valor:
+                return True
+    return False
+
+
+def db_listar_regras_email_importante(familia_id: str) -> list:
+    res = (
+        supabase.table("regras_email_importante")
+        .select("*")
+        .eq("familia_id", familia_id)
+        .order("nome")
+        .execute()
+    )
+    return res.data
+
+
+def db_criar_regra_email_importante(familia_id: str, nome: str, criterios: list):
+    supabase.table("regras_email_importante").insert({
+        "familia_id": familia_id, "nome": nome, "criterios": criterios,
+    }).execute()
+
+
+def db_excluir_regra_email_importante(regra_id: str):
+    supabase.table("regras_email_importante").delete().eq("id", regra_id).execute()
+
+
+def google_listar_labels(creds) -> list:
+    """Retorna os labels do Gmail do usuário (sistema + criados por ele)."""
+    from googleapiclient.discovery import build
+
+    service = build("gmail", "v1", credentials=creds)
+    result = service.users().labels().list(userId="me").execute()
+    return result.get("labels", [])
+
+
+def google_listar_emails(creds, max_results: int = 20, label_id: str = "INBOX", query: str = "") -> list:
+    """Retorna metadados (assunto, remetente, data, resumo) dos e-mails mais recentes de um label."""
+    from googleapiclient.discovery import build
+
+    service = build("gmail", "v1", credentials=creds)
+    params = {"userId": "me", "maxResults": max_results}
+    if label_id:
+        params["labelIds"] = [label_id]
+    if query:
+        params["q"] = query
+    result = service.users().messages().list(**params).execute()
+
+    emails = []
+    for _msg_ref in result.get("messages", []):
+        _msg = service.users().messages().get(
+            userId="me", id=_msg_ref["id"], format="metadata",
+            metadataHeaders=["Subject", "From", "Date"],
+        ).execute()
+        _headers = {h["name"]: h["value"] for h in _msg.get("payload", {}).get("headers", [])}
+        emails.append({
+            "id":        _msg_ref["id"],
+            "assunto":   _headers.get("Subject", "(sem assunto)"),
+            "remetente": _headers.get("From", ""),
+            "data":      _headers.get("Date", ""),
+            "resumo":    _msg.get("snippet", ""),
+        })
+    return emails
+
+
+# --- 3c. FUNÇÕES Z-API (WhatsApp) ---
+
+def zapi_carregar_config(familia_id: str) -> dict:
+    if "zapi_config" in st.session_state:
+        return st.session_state["zapi_config"]
+    try:
+        res = (
+            supabase.table("integracoes_familia")
+            .select("config")
+            .eq("familia_id", familia_id)
+            .eq("tipo", "zapi")
+            .single()
+            .execute()
+        )
+        cfg = res.data["config"] if res.data else {}
+    except Exception:
+        cfg = {}
+    st.session_state["zapi_config"] = cfg
+    return cfg
+
+
+def zapi_salvar_config(familia_id: str, config: dict):
+    supabase.table("integracoes_familia").upsert(
+        {"familia_id": familia_id, "tipo": "zapi", "config": config},
+        on_conflict="familia_id,tipo",
+    ).execute()
+    st.session_state["zapi_config"] = config
+
+
+def zapi_status(instance_id: str, token: str) -> str:
+    import requests as _req
+    try:
+        url = f"https://api.z-api.io/instances/{instance_id}/token/{token}/status"
+        r = _req.get(url, timeout=8)
+        return r.json().get("value", "unknown") if r.status_code == 200 else "error"
+    except Exception:
+        return "error"
+
+
+def zapi_enviar_mensagem(instance_id: str, token: str, telefone: str, mensagem: str) -> bool:
+    import requests as _req
+    try:
+        url = f"https://api.z-api.io/instances/{instance_id}/token/{token}/send-text"
+        r = _req.post(url, json={"phone": telefone, "message": mensagem}, timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 # --- 4. INTERFACE ---
 
-st.set_page_config(page_title="Sentinela Financeira", layout="wide")
+st.set_page_config(page_title="Controle Familiar", layout="wide", page_icon="🏠")
 
 # --- Autenticação ---
 _session = supabase.auth.get_session()
@@ -762,9 +1107,16 @@ if "familia_id" not in st.session_state:
 
 FAMILIA_ID = st.session_state["familia_id"]
 
-st.title("🛡️ Sentinela Financeira")
-
 with st.sidebar:
+    st.markdown("# 🏠 Controle Familiar")
+    st.divider()
+    modulo = st.radio(
+        "Módulo",
+        ["💰 Financeiro", "📅 Agenda", "📧 E-mails", "⚙️ Configurações"],
+        key="modulo_ativo",
+        label_visibility="collapsed",
+    )
+    st.divider()
     st.caption(f"👤 {_session.user.email}")
     if st.button("🚪 Sair", key="btn_logout"):
         supabase.auth.sign_out()
@@ -773,11 +1125,375 @@ with st.sidebar:
             st.session_state.pop(_k, None)
         st.rerun()
 
+_TITULOS = {
+    "💰 Financeiro": "🛡️ Sentinela Financeira",
+    "📅 Agenda":     "📅 Agenda",
+    "📧 E-mails":    "📧 E-mails",
+    "⚙️ Configurações": "⚙️ Configurações do Sistema",
+}
+st.title(_TITULOS[modulo])
+
 # Carrega configuração da família (cache 5 min)
 _config = buscar_config_familia(FAMILIA_ID)
 _nomes_membros    = [m["nome"] for m in _config["membros"]]
 _compradores_para = _nomes_membros + ["Família"]
 
+# =============================================================
+# MÓDULOS NÃO-FINANCEIROS — stubs até implementação completa
+# =============================================================
+if modulo == "📅 Agenda":
+    if "google_oauth_error" in st.session_state:
+        st.error(f"Erro ao conectar Google: {st.session_state.pop('google_oauth_error')}")
+
+    if st.session_state.pop("google_conectado", False):
+        st.success("Google Calendar conectado com sucesso!")
+
+    _gcreds = google_get_credentials()
+
+    if _gcreds is None:
+        st.info("Conecte sua conta Google para visualizar os eventos da agenda.")
+        _col1, _col2 = st.columns([1, 2])
+        with _col1:
+            if os.path.exists(_GOOGLE_CREDS_FILE):
+                _auth_url = google_iniciar_oauth()
+                st.link_button("🔗 Conectar Google Calendar", url=_auth_url, type="primary")
+            else:
+                st.warning("Arquivo `google_credentials.json` não encontrado na pasta do projeto.")
+        with _col2:
+            st.markdown("""
+**Como funciona:**
+1. Clique no botão ao lado
+2. Faça login na sua conta Google
+3. Autorize o acesso à Agenda
+4. Você voltará aqui automaticamente com os eventos carregados
+            """)
+    else:
+        _col_per, _ = st.columns([3, 5])
+        with _col_per:
+            _dias = st.radio("Período", [7, 14, 30], index=0,
+                             format_func=lambda x: f"Próximos {x} dias", horizontal=True)
+
+        with st.spinner("Carregando eventos..."):
+            try:
+                _eventos = google_listar_eventos(_gcreds, dias=_dias)
+            except Exception as _ex:
+                st.error(f"Erro ao carregar eventos: {_ex}")
+                _eventos = []
+
+        _zapi_cfg_ag = zapi_carregar_config(FAMILIA_ID)
+        _zapi_ok = bool(_zapi_cfg_ag.get("instance_id") and _zapi_cfg_ag.get("telefone"))
+
+        if not _eventos:
+            st.info(f"Nenhum evento nos próximos {_dias} dias.")
+        else:
+            st.caption(f"{len(_eventos)} evento(s) encontrado(s)")
+            for _i_ev, _ev in enumerate(_eventos):
+                _inicio_raw = _ev["start"].get("dateTime", _ev["start"].get("date", ""))
+                _titulo = _ev.get("summary", "Sem título")
+                _local  = _ev.get("location", "")
+                _desc   = (_ev.get("description") or "").strip()
+                try:
+                    from datetime import datetime as _dtt, date as _date_t
+                    if "T" in _inicio_raw:
+                        _dt_ev = _dtt.fromisoformat(_inicio_raw)
+                        _data_fmt = _dt_ev.strftime("%d/%m  %H:%M")
+                    else:
+                        _dt_ev = _date_t.fromisoformat(_inicio_raw)
+                        _data_fmt = _dt_ev.strftime("%d/%m") + "  dia todo"
+                except Exception:
+                    _data_fmt = _inicio_raw
+
+                with st.container(border=True):
+                    _c1, _c2, _c3 = st.columns([4, 1, 1])
+                    with _c1:
+                        st.markdown(f"**{_titulo}**")
+                        if _local:
+                            st.caption(f"📍 {_local}")
+                        if _desc:
+                            st.caption(_desc[:150] + ("…" if len(_desc) > 150 else ""))
+                    with _c2:
+                        st.markdown(f"`{_data_fmt}`")
+                    with _c3:
+                        if _zapi_ok:
+                            if st.button("📲", key=f"zapi_ev_{_i_ev}", help="Enviar lembrete via WhatsApp"):
+                                _msg_ev = f"📅 *{_titulo}*\n🗓️ {_data_fmt}"
+                                if _local:
+                                    _msg_ev += f"\n📍 {_local}"
+                                if _desc:
+                                    _msg_ev += f"\n\n{_desc[:200]}"
+                                with st.spinner("Enviando..."):
+                                    _ok_ev = zapi_enviar_mensagem(
+                                        _zapi_cfg_ag["instance_id"], _zapi_cfg_ag["token"],
+                                        _zapi_cfg_ag["telefone"], _msg_ev,
+                                    )
+                                if _ok_ev:
+                                    st.toast("Lembrete enviado! ✅")
+                                else:
+                                    st.toast("Falha ao enviar ❌")
+
+        st.divider()
+        if st.button("🔌 Desconectar Google", type="secondary"):
+            if os.path.exists(_GOOGLE_TOKEN_FILE):
+                os.remove(_GOOGLE_TOKEN_FILE)
+            st.session_state.pop("google_token", None)
+            st.rerun()
+
+    st.stop()
+
+if modulo == "📧 E-mails":
+    if "google_oauth_error" in st.session_state:
+        st.error(f"Erro ao conectar Google: {st.session_state.pop('google_oauth_error')}")
+
+    if st.session_state.pop("google_conectado", False):
+        st.success("Google conectado com sucesso!")
+
+    _gcreds_mail = google_get_credentials()
+
+    if _gcreds_mail is None:
+        st.info("Conecte sua conta Google para visualizar seus e-mails.")
+        _col1, _col2 = st.columns([1, 2])
+        with _col1:
+            if os.path.exists(_GOOGLE_CREDS_FILE):
+                _auth_url_mail = google_iniciar_oauth()
+                st.link_button("🔗 Conectar Gmail", url=_auth_url_mail, type="primary")
+            else:
+                st.warning("Arquivo `google_credentials.json` não encontrado na pasta do projeto.")
+        with _col2:
+            st.markdown("""
+**Como funciona:**
+1. Clique no botão ao lado
+2. Faça login na sua conta Google
+3. Autorize o acesso ao Gmail
+4. Você voltará aqui automaticamente com os e-mails carregados
+            """)
+    else:
+        try:
+            _labels_gmail = google_listar_labels(_gcreds_mail)
+            _opcoes_label = {"Caixa de entrada": "INBOX"}
+            for _lbl in _labels_gmail:
+                if _lbl.get("type") == "user":
+                    _opcoes_label[_lbl["name"]] = _lbl["id"]
+        except Exception as _ex_lbl:
+            st.error(f"Erro ao carregar labels: {_ex_lbl}")
+            _opcoes_label = {"Caixa de entrada": "INBOX"}
+
+        _c_lbl, _c_busca = st.columns([2, 3])
+        with _c_lbl:
+            _label_nome = st.selectbox("Label", list(_opcoes_label.keys()))
+        with _c_busca:
+            _busca_email = st.text_input("Buscar", placeholder="ex: assunto, remetente, palavra-chave...")
+
+        _c_fin, _c_imp = st.columns(2)
+        with _c_fin:
+            _so_financeiros = st.checkbox("💸 Somente boletos/faturas", value=False)
+        with _c_imp:
+            _so_importantes = st.checkbox("⭐ Somente muito importantes", value=False)
+
+        _regras_importantes = db_listar_regras_email_importante(FAMILIA_ID)
+        with st.expander("⚙️ Gerenciar regras de importância (⭐)"):
+            st.caption(
+                "Crie grupos de regras para marcar automaticamente e-mails de remetentes "
+                "específicos ou domínios como **muito importantes** (ex: e-mails do trabalho)."
+            )
+            if _regras_importantes:
+                for _r in _regras_importantes:
+                    with st.container(border=True):
+                        _rc1, _rc2, _rc3 = st.columns([3, 5, 1])
+                        with _rc1:
+                            st.markdown(f"**⭐ {_r['nome']}**")
+                        with _rc2:
+                            _doms = [c["valor"] for c in _r["criterios"] if c.get("tipo") == "dominio"]
+                            _ems  = [c["valor"] for c in _r["criterios"] if c.get("tipo") == "email"]
+                            _partes = []
+                            if _doms:
+                                _partes.append("domínio: " + ", ".join(_doms))
+                            if _ems:
+                                _partes.append("e-mail: " + ", ".join(_ems))
+                            st.caption(" · ".join(_partes) if _partes else "(sem critérios)")
+                        with _rc3:
+                            if st.button("🗑️", key=f"del_regra_imp_{_r['id']}", help="Excluir grupo"):
+                                db_excluir_regra_email_importante(_r["id"])
+                                st.rerun()
+                st.divider()
+
+            st.markdown("**Novo grupo**")
+            with st.form("form_nova_regra_email_importante", clear_on_submit=True):
+                _nome_grupo = st.text_input("Nome do grupo", placeholder="ex: Trabalho - MundoTelecom")
+                _fc1, _fc2 = st.columns(2)
+                with _fc1:
+                    _dominios_txt = st.text_area(
+                        "Domínios (um por linha)", placeholder="mundotelecom.com.br",
+                        help="Marca como importante qualquer remetente desse domínio (ou subdomínio).",
+                    )
+                with _fc2:
+                    _emails_txt = st.text_area(
+                        "E-mails específicos (um por linha)", placeholder="fulano@empresa.com",
+                    )
+                if st.form_submit_button("➕ Adicionar grupo"):
+                    _criterios = []
+                    for _d in [l.strip().lstrip("@").lower() for l in _dominios_txt.splitlines() if l.strip()]:
+                        _criterios.append({"tipo": "dominio", "valor": _d})
+                    for _e in [l.strip().lower() for l in _emails_txt.splitlines() if l.strip()]:
+                        _criterios.append({"tipo": "email", "valor": _e})
+                    if _nome_grupo and _criterios:
+                        db_criar_regra_email_importante(FAMILIA_ID, _nome_grupo, _criterios)
+                        st.success("Grupo criado!")
+                        st.rerun()
+                    else:
+                        st.warning("Informe um nome e ao menos um domínio ou e-mail.")
+
+        with st.spinner("Carregando e-mails..."):
+            try:
+                _emails = google_listar_emails(
+                    _gcreds_mail, max_results=30,
+                    label_id=_opcoes_label[_label_nome], query=_busca_email,
+                )
+            except Exception as _ex_mail:
+                st.error(f"Erro ao carregar e-mails: {_ex_mail}")
+                _emails = []
+
+        if _so_financeiros:
+            _emails = [e for e in _emails if _email_eh_financeiro(e["assunto"], e["resumo"])]
+        if _so_importantes:
+            _emails = [e for e in _emails if _email_eh_muito_importante(e["remetente"], _regras_importantes)]
+
+        _zapi_cfg_mail = zapi_carregar_config(FAMILIA_ID)
+        _zapi_ok_mail = bool(_zapi_cfg_mail.get("instance_id") and _zapi_cfg_mail.get("telefone"))
+
+        if not _emails:
+            st.info("Nenhum e-mail encontrado para os filtros selecionados.")
+        else:
+            st.caption(f"{len(_emails)} e-mail(s) encontrado(s)")
+            for _i_em, _em in enumerate(_emails):
+                try:
+                    from email.utils import parsedate_to_datetime as _parsedate
+                    _data_fmt_em = _parsedate(_em["data"]).strftime("%d/%m  %H:%M")
+                except Exception:
+                    _data_fmt_em = _em["data"][:16]
+
+                _financeiro = _email_eh_financeiro(_em["assunto"], _em["resumo"])
+                _importante = _email_eh_muito_importante(_em["remetente"], _regras_importantes)
+
+                with st.container(border=True):
+                    _ce1, _ce2, _ce3 = st.columns([4, 1, 1])
+                    with _ce1:
+                        _badge = ("⭐ " if _importante else "") + ("💸 " if _financeiro else "")
+                        st.markdown(f"**{_badge}{_em['assunto']}**")
+                        st.caption(f"De: {_em['remetente']}")
+                        if _em["resumo"]:
+                            st.caption(_em["resumo"][:150] + ("…" if len(_em["resumo"]) > 150 else ""))
+                    with _ce2:
+                        st.markdown(f"`{_data_fmt_em}`")
+                    with _ce3:
+                        if _zapi_ok_mail:
+                            if st.button("📲", key=f"zapi_email_{_i_em}", help="Encaminhar para WhatsApp"):
+                                _msg_em = (
+                                    f"📧 *{_em['assunto']}*\n"
+                                    f"De: {_em['remetente']}\n\n"
+                                    f"{_em['resumo'][:300]}"
+                                )
+                                with st.spinner("Enviando..."):
+                                    _ok_em = zapi_enviar_mensagem(
+                                        _zapi_cfg_mail["instance_id"], _zapi_cfg_mail["token"],
+                                        _zapi_cfg_mail["telefone"], _msg_em,
+                                    )
+                                if _ok_em:
+                                    st.toast("E-mail encaminhado! ✅")
+                                else:
+                                    st.toast("Falha ao enviar ❌")
+
+        st.divider()
+        if st.button("🔌 Desconectar Google", type="secondary", key="btn_desconectar_google_email"):
+            if os.path.exists(_GOOGLE_TOKEN_FILE):
+                os.remove(_GOOGLE_TOKEN_FILE)
+            st.session_state.pop("google_token", None)
+            st.rerun()
+
+    st.stop()
+
+if modulo == "⚙️ Configurações":
+    _tab_zapi, _tab_google = st.tabs(["📱 WhatsApp (Z-API)", "🔗 Google"])
+
+    # ── Aba Z-API ──────────────────────────────────────────────
+    with _tab_zapi:
+        _zapi_cfg = zapi_carregar_config(FAMILIA_ID)
+
+        with st.expander("ℹ️ Como obter as credenciais Z-API", expanded=not bool(_zapi_cfg.get("instance_id"))):
+            st.markdown("""
+1. Acesse **[z-api.io](https://z-api.io)** e crie uma conta gratuita
+2. Crie uma nova instância → você receberá o **Instance ID** e o **Token**
+3. Cole abaixo, salve, e use o QR Code para conectar seu WhatsApp
+            """)
+
+        with st.form("form_zapi_config"):
+            _c1, _c2 = st.columns(2)
+            with _c1:
+                _inst = st.text_input("Instance ID", value=_zapi_cfg.get("instance_id", ""),
+                                      placeholder="ex: 3B0B1234ABCD")
+            with _c2:
+                _tok = st.text_input("Token", value=_zapi_cfg.get("token", ""),
+                                     type="password", placeholder="ex: ABC123...")
+            _fone = st.text_input(
+                "Telefone para notificações",
+                value=_zapi_cfg.get("telefone", ""),
+                placeholder="5511999999999  (código país + DDD + número, sem espaços)",
+            )
+            if st.form_submit_button("💾 Salvar configuração"):
+                if _inst and _tok and _fone:
+                    zapi_salvar_config(FAMILIA_ID, {
+                        "instance_id": _inst, "token": _tok, "telefone": _fone,
+                    })
+                    st.success("Configuração salva!")
+                    st.rerun()
+                else:
+                    st.warning("Preencha todos os campos.")
+
+        if _zapi_cfg.get("instance_id"):
+            st.divider()
+            with st.spinner("Verificando conexão..."):
+                _wstatus = zapi_status(_zapi_cfg["instance_id"], _zapi_cfg["token"])
+
+            if _wstatus in ("connected", "CONNECTED"):
+                st.success("✅ WhatsApp conectado")
+                _col_test, _ = st.columns([2, 3])
+                with _col_test:
+                    if st.button("📲 Enviar mensagem de teste"):
+                        with st.spinner("Enviando..."):
+                            _ok = zapi_enviar_mensagem(
+                                _zapi_cfg["instance_id"], _zapi_cfg["token"],
+                                _zapi_cfg["telefone"],
+                                "✅ *Controle Familiar* conectado com sucesso!\n\nVocê receberá notificações aqui.",
+                            )
+                        if _ok:
+                            st.success("Mensagem enviada! Verifique seu WhatsApp.")
+                        else:
+                            st.error("Falha ao enviar. Verifique as credenciais.")
+            else:
+                st.warning(f"Status: **{_wstatus}** — escaneie o QR Code abaixo com o WhatsApp para conectar.")
+                _qr_url = (
+                    f"https://api.z-api.io/instances/{_zapi_cfg['instance_id']}"
+                    f"/token/{_zapi_cfg['token']}/qr-code/image"
+                )
+                st.image(_qr_url, width=260, caption="Abra o WhatsApp → Dispositivos conectados → Conectar dispositivo")
+
+    # ── Aba Google ─────────────────────────────────────────────
+    with _tab_google:
+        _gcreds2 = google_get_credentials()
+        if _gcreds2 is not None:
+            st.success("✅ Google conectado")
+            if st.button("🔌 Desconectar Google", key="btn_desc_google_cfg"):
+                if os.path.exists(_GOOGLE_TOKEN_FILE):
+                    os.remove(_GOOGLE_TOKEN_FILE)
+                st.session_state.pop("google_token", None)
+                st.rerun()
+        else:
+            st.info("Google não conectado. Vá ao módulo **📅 Agenda** para conectar.")
+
+    st.stop()
+
+# =============================================================
+# MÓDULO FINANCEIRO — navegação original
+# =============================================================
 pagina = st.sidebar.selectbox(
     "Navegação",
     ["📄 Processar Arquivos", "💳 Gerenciar Lançamentos", "📊 Relatórios",
@@ -867,7 +1583,7 @@ if pagina == "📄 Processar Arquivos":
             except Exception as e:
                 status.warning(f"⚠️ Não foi possível limpar lançamentos anteriores: {e}")
 
-            with ThreadPoolExecutor(max_workers=min(total, 5)) as executor:
+            with ThreadPoolExecutor(max_workers=min(total, 2)) as executor:
                 futuros = {
                     executor.submit(processar_arquivo, nome, dados, mes_referencia_str, _config): nome
                     for nome, dados in arquivos
@@ -880,11 +1596,14 @@ if pagina == "📄 Processar Arquivos":
                         resultado, tipo_arq = futuro.result()
                         consolidado.extend(resultado)
                         icone = "🏦" if tipo_arq == "extrato" else "💳"
-                        status.success(f"{icone} {nome} — {len(resultado)} lançamento(s)")
+                        if resultado:
+                            status.success(f"{icone} {nome} — {len(resultado)} lançamento(s)")
+                        else:
+                            status.warning(f"⚠️ {nome} — 0 lançamentos extraídos (verifique se o PDF tem texto selecionável)")
                     except json.JSONDecodeError as e:
                         erros.append(nome); status.error(f"Erro JSON em {nome}: {e}")
                     except Exception as e:
-                        erros.append(nome); status.error(f"Erro em {nome}: {e}")
+                        erros.append(nome); status.error(f"❌ Erro em {nome}: {e}")
                     progress.progress(concluidos / total, text=f"{concluidos}/{total} processados")
 
             progress.empty()
@@ -949,6 +1668,19 @@ if pagina == "📄 Processar Arquivos":
                                 r[k] = int(v)
                             elif v != v:
                                 r[k] = None
+
+                    # DELETE de segurança: remove qualquer dado residual dos mesmos cartões
+                    # antes de inserir — garante que reimportações não causem duplicação
+                    _cartoes_para_salvar = list({
+                        r["cartao"] for r in registros if r.get("cartao")
+                    })
+                    if _cartoes_para_salvar:
+                        supabase.table("lancamentos").delete()\
+                            .eq("mes_referencia", mes_referencia_str)\
+                            .eq("familia_id", FAMILIA_ID)\
+                            .in_("cartao", _cartoes_para_salvar)\
+                            .execute()
+
                     supabase.table("lancamentos").insert(registros).execute()
                     st.balloons()
                     st.success("Dados gravados com sucesso!")
