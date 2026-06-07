@@ -953,22 +953,30 @@ def _email_eh_financeiro(assunto: str, resumo: str) -> bool:
     return any(p in texto for p in _PALAVRAS_EMAIL_FINANCEIRO)
 
 
-def _email_eh_muito_importante(remetente: str, regras: list) -> bool:
-    """Verifica se o remetente bate com algum critério (domínio ou e-mail) de algum grupo ativo."""
+def _normalizar_texto_email(texto: str) -> str:
+    """Lowercase e remove acentos para comparações tolerantes de assunto."""
+    _norm = unicodedata.normalize("NFKD", (texto or "").lower())
+    return "".join(c for c in _norm if not unicodedata.combining(c))
+
+
+def _email_eh_muito_importante(remetente: str, assunto: str, regras: list) -> bool:
+    """Verifica se o remetente ou o assunto bate com algum critério (domínio, e-mail
+    ou texto contido no assunto) de algum grupo ativo."""
     _match = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", remetente or "")
-    if not _match:
-        return False
-    _email = _match.group(0).lower()
-    _dominio = _email.split("@", 1)[1]
+    _email = _match.group(0).lower() if _match else ""
+    _dominio = _email.split("@", 1)[1] if _email else ""
+    _assunto_norm = _normalizar_texto_email(assunto)
     for _regra in regras:
         if not _regra.get("ativo", True):
             continue
         for _crit in _regra.get("criterios", []):
             _valor = (_crit.get("valor") or "").lower()
             _tipo = _crit.get("tipo")
-            if _tipo == "dominio" and (_dominio == _valor or _dominio.endswith("." + _valor)):
+            if _tipo == "dominio" and _email and (_dominio == _valor or _dominio.endswith("." + _valor)):
                 return True
-            if _tipo == "email" and _email == _valor:
+            if _tipo == "email" and _email and _email == _valor:
+                return True
+            if _tipo == "assunto" and _valor and _normalizar_texto_email(_valor) in _assunto_norm:
                 return True
     return False
 
@@ -1283,6 +1291,24 @@ if modulo == "📧 E-mails":
         with _c_busca:
             _busca_email = st.text_input("Buscar", placeholder="ex: assunto, remetente, palavra-chave...")
 
+        st.caption("Período")
+        _periodo_sel = st.segmented_control(
+            "Período", ["Tudo", "Hoje", "Ontem", "Por período"],
+            default="Tudo", key="email_periodo_sel", label_visibility="collapsed",
+        ) or "Tudo"
+        _data_periodo_ini = _data_periodo_fim = None
+        if _periodo_sel == "Por período":
+            _cd1, _cd2 = st.columns(2)
+            with _cd1:
+                _data_periodo_ini = st.date_input("De", key="email_periodo_ini")
+            with _cd2:
+                _data_periodo_fim = st.date_input("Até", key="email_periodo_fim")
+
+        _status_leitura_sel = st.radio(
+            "Status de leitura", ["Ambos", "Lidos", "Não lidos"],
+            horizontal=True, key="email_status_leitura",
+        )
+
         _c_fin, _c_imp = st.columns(2)
         with _c_fin:
             _so_financeiros = st.checkbox("💸 Somente boletos/faturas", value=False)
@@ -1304,11 +1330,14 @@ if modulo == "📧 E-mails":
                         with _rc2:
                             _doms = [c["valor"] for c in _r["criterios"] if c.get("tipo") == "dominio"]
                             _ems  = [c["valor"] for c in _r["criterios"] if c.get("tipo") == "email"]
+                            _asss = [c["valor"] for c in _r["criterios"] if c.get("tipo") == "assunto"]
                             _partes = []
                             if _doms:
                                 _partes.append("domínio: " + ", ".join(_doms))
                             if _ems:
                                 _partes.append("e-mail: " + ", ".join(_ems))
+                            if _asss:
+                                _partes.append("assunto contém: " + ", ".join(_asss))
                             st.caption(" · ".join(_partes) if _partes else "(sem critérios)")
                         with _rc3:
                             if st.button("🗑️", key=f"del_regra_imp_{_r['id']}", help="Excluir grupo"):
@@ -1319,7 +1348,7 @@ if modulo == "📧 E-mails":
             st.markdown("**Novo grupo**")
             with st.form("form_nova_regra_email_importante", clear_on_submit=True):
                 _nome_grupo = st.text_input("Nome do grupo", placeholder="ex: Trabalho - MundoTelecom")
-                _fc1, _fc2 = st.columns(2)
+                _fc1, _fc2, _fc3 = st.columns(3)
                 with _fc1:
                     _dominios_txt = st.text_area(
                         "Domínios (um por linha)", placeholder="mundotelecom.com.br",
@@ -1329,24 +1358,58 @@ if modulo == "📧 E-mails":
                     _emails_txt = st.text_area(
                         "E-mails específicos (um por linha)", placeholder="fulano@empresa.com",
                     )
+                with _fc3:
+                    _assuntos_txt = st.text_area(
+                        "Texto no assunto (um por linha)", placeholder="ex: contrato, proposta",
+                        help="Marca como importante e-mails cujo assunto contenha qualquer um desses textos.",
+                    )
                 if st.form_submit_button("➕ Adicionar grupo"):
                     _criterios = []
                     for _d in [l.strip().lstrip("@").lower() for l in _dominios_txt.splitlines() if l.strip()]:
                         _criterios.append({"tipo": "dominio", "valor": _d})
                     for _e in [l.strip().lower() for l in _emails_txt.splitlines() if l.strip()]:
                         _criterios.append({"tipo": "email", "valor": _e})
+                    for _a in [l.strip().lower() for l in _assuntos_txt.splitlines() if l.strip()]:
+                        _criterios.append({"tipo": "assunto", "valor": _a})
                     if _nome_grupo and _criterios:
                         db_criar_regra_email_importante(FAMILIA_ID, _nome_grupo, _criterios)
                         st.success("Grupo criado!")
                         st.rerun()
                     else:
-                        st.warning("Informe um nome e ao menos um domínio ou e-mail.")
+                        st.warning("Informe um nome e ao menos um domínio, e-mail ou texto no assunto.")
+
+        from datetime import timedelta as _td_email
+        _hoje_email = date.today()
+        _q_periodo = ""
+        if _periodo_sel == "Hoje":
+            _q_periodo = (
+                f"after:{_hoje_email.strftime('%Y/%m/%d')} "
+                f"before:{(_hoje_email + _td_email(days=1)).strftime('%Y/%m/%d')}"
+            )
+        elif _periodo_sel == "Ontem":
+            _ontem_email = _hoje_email - _td_email(days=1)
+            _q_periodo = (
+                f"after:{_ontem_email.strftime('%Y/%m/%d')} "
+                f"before:{_hoje_email.strftime('%Y/%m/%d')}"
+            )
+        elif _periodo_sel == "Por período" and _data_periodo_ini and _data_periodo_fim:
+            _q_periodo = (
+                f"after:{_data_periodo_ini.strftime('%Y/%m/%d')} "
+                f"before:{(_data_periodo_fim + _td_email(days=1)).strftime('%Y/%m/%d')}"
+            )
+
+        _q_status = {"Lidos": "is:read", "Não lidos": "is:unread"}.get(_status_leitura_sel, "")
+        _busca_txt = _busca_email.strip().replace('"', "")
+        _q_busca = (
+            f'(from:"{_busca_txt}" OR subject:"{_busca_txt}")' if _busca_txt else ""
+        )
+        _query_email = " ".join(p for p in [_q_busca, _q_periodo, _q_status] if p)
 
         with st.spinner("Carregando e-mails..."):
             try:
                 _emails = google_listar_emails(
                     _gcreds_mail, max_results=30,
-                    label_id=_opcoes_label[_label_nome], query=_busca_email,
+                    label_id=_opcoes_label[_label_nome], query=_query_email,
                 )
             except Exception as _ex_mail:
                 st.error(f"Erro ao carregar e-mails: {_ex_mail}")
@@ -1355,7 +1418,7 @@ if modulo == "📧 E-mails":
         if _so_financeiros:
             _emails = [e for e in _emails if _email_eh_financeiro(e["assunto"], e["resumo"])]
         if _so_importantes:
-            _emails = [e for e in _emails if _email_eh_muito_importante(e["remetente"], _regras_importantes)]
+            _emails = [e for e in _emails if _email_eh_muito_importante(e["remetente"], e["assunto"], _regras_importantes)]
 
         _zapi_cfg_mail = zapi_carregar_config(FAMILIA_ID)
         _zapi_ok_mail = bool(_zapi_cfg_mail.get("instance_id") and _zapi_cfg_mail.get("telefone"))
@@ -1372,7 +1435,7 @@ if modulo == "📧 E-mails":
                     _data_fmt_em = _em["data"][:16]
 
                 _financeiro = _email_eh_financeiro(_em["assunto"], _em["resumo"])
-                _importante = _email_eh_muito_importante(_em["remetente"], _regras_importantes)
+                _importante = _email_eh_muito_importante(_em["remetente"], _em["assunto"], _regras_importantes)
 
                 with st.container(border=True):
                     _ce1, _ce2, _ce3 = st.columns([4, 1, 1])
